@@ -1,0 +1,64 @@
+#pragma once
+
+#include <mutex>
+#include <condition_variable>
+#include <cstdint>
+
+extern "C" {
+#include <libavcodec/avcodec.h>
+}
+
+namespace ccplayer {
+
+struct VideoFrame {
+    AVFrame* frame;
+    double pts;
+    int width;
+    int height;
+    int format;
+};
+
+struct AudioFrame {
+    AVFrame* frame;
+    double pts;
+    int sampleRate;
+    int channels;
+};
+
+class FrameQueue {
+public:
+    FrameQueue(int maxSize);
+    ~FrameQueue();
+
+    int pushVideoFrame(AVFrame* frame, double pts);
+    int pushAudioFrame(AVFrame* frame, double pts);
+
+    int popVideoFrame(VideoFrame* out, bool block);
+    int popAudioFrame(AudioFrame* out, bool block);
+
+    void flush();
+    void abort();
+
+    int size() const;
+
+private:
+    struct FrameNode {
+        AVFrame* frame;
+        double pts;
+        bool isVideo;
+        int sampleRate;
+        int channels;
+        FrameNode* next;
+    };
+
+    FrameNode* m_head;
+    FrameNode* m_tail;
+    int m_count;
+    int m_maxSize;
+    bool m_abort;
+
+    mutable std::mutex m_mutex;
+    std::condition_variable m_cond;
+};
+
+} // namespace ccplayer
