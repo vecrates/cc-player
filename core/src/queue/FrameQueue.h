@@ -13,6 +13,7 @@ namespace ccplayer {
 struct VideoFrame {
     AVFrame* frame;
     double pts;
+    int serial;   // 所属 seek 代际
     int width;
     int height;
     int format;
@@ -21,6 +22,7 @@ struct VideoFrame {
 struct AudioFrame {
     AVFrame* frame;
     double pts;
+    int serial;   // 所属 seek 代际
     int sampleRate;
     int channels;
 };
@@ -30,14 +32,16 @@ public:
     FrameQueue(int maxSize);
     ~FrameQueue();
 
-    int pushVideoFrame(AVFrame* frame, double pts);
-    int pushAudioFrame(AVFrame* frame, double pts);
+    int pushVideoFrame(AVFrame* frame, double pts, int serial);
+    int pushAudioFrame(AVFrame* frame, double pts, int serial);
 
     int popVideoFrame(VideoFrame* out, bool block);
     int popAudioFrame(AudioFrame* out, bool block);
 
     void flush();
     void abort();
+    // 清除 abort 标志（保留数据），供 pause/resume 复用队列
+    void reset();
 
     int size() const;
 
@@ -45,6 +49,7 @@ private:
     struct FrameNode {
         AVFrame* frame;
         double pts;
+        int serial;
         bool isVideo;
         int sampleRate;
         int channels;

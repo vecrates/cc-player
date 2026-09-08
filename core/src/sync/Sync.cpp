@@ -41,9 +41,14 @@ void AudioVideoSyncer::setMasterClock(Clock* audioClock) {
     m_masterClock = audioClock;
 }
 
+void AudioVideoSyncer::setMasterTimeProvider(MasterTimeProvider provider) {
+    m_provider = std::move(provider);
+}
+
 double AudioVideoSyncer::getMasterTime() {
-    if (!m_masterClock) return 0.0;
-    return m_masterClock->getPTS();
+    if (m_provider) return m_provider();
+    if (m_masterClock) return m_masterClock->getPTS();
+    return 0.0;
 }
 
 double AudioVideoSyncer::computeVideoDelay(double videoPTS) {
@@ -55,6 +60,11 @@ double AudioVideoSyncer::computeVideoDelay(double videoPTS) {
     }
 
     return delay;
+}
+
+bool AudioVideoSyncer::shouldDrop(double videoPTS) {
+    double masterTime = getMasterTime();
+    return (videoPTS - masterTime) < -m_dropThreshold;
 }
 
 void AudioVideoSyncer::setMaxDelay(double maxDelay) {

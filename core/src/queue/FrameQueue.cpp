@@ -22,7 +22,7 @@ FrameQueue::~FrameQueue() {
     flush();
 }
 
-int FrameQueue::pushVideoFrame(AVFrame* frame, double pts) {
+int FrameQueue::pushVideoFrame(AVFrame* frame, double pts, int serial) {
     std::unique_lock<std::mutex> lock(m_mutex);
 
     while (m_count >= m_maxSize && !m_abort) {
@@ -39,6 +39,7 @@ int FrameQueue::pushVideoFrame(AVFrame* frame, double pts) {
     auto* node = new FrameNode();
     node->frame = cloned;
     node->pts = pts;
+    node->serial = serial;
     node->isVideo = true;
     node->sampleRate = 0;
     node->channels = 0;
@@ -56,7 +57,7 @@ int FrameQueue::pushVideoFrame(AVFrame* frame, double pts) {
     return 0;
 }
 
-int FrameQueue::pushAudioFrame(AVFrame* frame, double pts) {
+int FrameQueue::pushAudioFrame(AVFrame* frame, double pts, int serial) {
     std::unique_lock<std::mutex> lock(m_mutex);
 
     while (m_count >= m_maxSize && !m_abort) {
@@ -73,6 +74,7 @@ int FrameQueue::pushAudioFrame(AVFrame* frame, double pts) {
     auto* node = new FrameNode();
     node->frame = cloned;
     node->pts = pts;
+    node->serial = serial;
     node->isVideo = false;
     node->sampleRate = frame->sample_rate;
     node->channels = frame->ch_layout.nb_channels;
@@ -125,6 +127,7 @@ int FrameQueue::popVideoFrame(VideoFrame* out, bool block) {
 
     out->frame = node->frame;
     out->pts = node->pts;
+    out->serial = node->serial;
     out->width = node->frame->width;
     out->height = node->frame->height;
     out->format = node->frame->format;
@@ -169,6 +172,7 @@ int FrameQueue::popAudioFrame(AudioFrame* out, bool block) {
 
     out->frame = node->frame;
     out->pts = node->pts;
+    out->serial = node->serial;
     out->sampleRate = node->sampleRate;
     out->channels = node->channels;
     delete node;
@@ -196,6 +200,11 @@ void FrameQueue::abort() {
     std::unique_lock<std::mutex> lock(m_mutex);
     m_abort = true;
     m_cond.notify_all();
+}
+
+void FrameQueue::reset() {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_abort = false;
 }
 
 int FrameQueue::size() const {

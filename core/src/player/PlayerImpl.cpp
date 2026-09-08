@@ -1,49 +1,47 @@
 #include "PlayerImpl.h"
 #include <cstring>
 
-extern "C" {
-#include <libswresample/swresample.h>
-}
-
 #define TAG "Player"
 
 namespace ccplayer {
 
+// 帧队列容量：视频帧内存较大取 10 帧，音频帧较小取 5 帧，队列满时阻塞解码线程形成背压
 static const int VIDEO_FRAME_QUEUE_SIZE = 10;
 static const int AUDIO_FRAME_QUEUE_SIZE = 5;
 
+// 标识当前线程是否为控制线程（用于避免控制线程内重入 stop/release 造成死锁）
+static thread_local bool t_inControlThread = false;
+
 PlayerImpl::PlayerImpl()
-    : m_state(PlayerState::Idle)
+    : m_userData(nullptr)
     , m_videoFrameQueue(VIDEO_FRAME_QUEUE_SIZE)
     , m_audioFrameQueue(AUDIO_FRAME_QUEUE_SIZE)
-    , m_audioOutput(nullptr)
-    , m_nativeWindow(nullptr)
-    , m_renderRunning(false)
-    , m_audioRunning(false)
-    , m_audioSampleRate(0)
-    , m_audioChannels(0)
-    , m_ringBuffer(nullptr)
-    , m_swrCtx(nullptr)
-    , m_userData(nullptr)
-    , m_eglDisplay(EGL_NO_DISPLAY)
-    , m_eglContext(EGL_NO_CONTEXT)
-    , m_eglSurface(EGL_NO_SURFACE)
-    , m_eglInitialized(false)
-    , m_surfaceWidth(0)
-    , m_surfaceHeight(0)
+    , m_videoRenderer(&m_videoFrameQueue, &m_syncer)
+    , m_audioRenderer(&m_audioFrameQueue)
 {
     memset(&m_callbacks, 0, sizeof(m_callbacks));
-    m_syncer.setMasterClock(&m_audioClock);
+
+    // 启动控制线程（消息循环）
+    m_controlRunning = true;
+    m_controlThread = std::thread(&PlayerImpl::controlLoop, this);
 }
 
 PlayerImpl::~PlayerImpl() {
     release();
+    m_controlRunning = false;
+    m_cmdQueue.abort();
+    if (m_controlThread.joinable()) {
+        m_controlThread.join();
+    }
 }
 
+// ==================== 配置接口（同步） ====================
+
 void PlayerImpl::setDataSource(const char* path) {
-    std::lock_guard<std::mutex> lock(m_stateMutex);
-    if (m_state != PlayerState::Idle && m_state != PlayerState::Stopped) {
-        LOGW(TAG, "setDataSource called in state %d", (int)m_state);
+    std::lock_guard<std::mutex> lock(m_configMutex);
+    PlayerState s = m_state.load();
+    if (s != PlayerState::Idle && s != PlayerState::Stopped) {
+        LOGW(TAG, "setDataSource called in state %d", (int)s);
         return;
     }
     m_dataSource = path;
@@ -52,468 +50,415 @@ void PlayerImpl::setDataSource(const char* path) {
 }
 
 void PlayerImpl::setSurface(void* nativeWindow) {
-    m_nativeWindow = nativeWindow;
+    m_videoRenderer.setSurface(nativeWindow);
 }
 
 void PlayerImpl::setSurfaceSize(int width, int height) {
-    m_surfaceWidth = width;
-    m_surfaceHeight = height;
+    m_videoRenderer.setSurfaceSize(width, height);
 }
 
+void PlayerImpl::setCallbacks(const PlayerCallbacks& callbacks) {
+    std::lock_guard<std::mutex> lock(m_configMutex);
+    m_callbacks = callbacks;
+}
+
+void PlayerImpl::setUserData(void* userData) {
+    std::lock_guard<std::mutex> lock(m_configMutex);
+    m_userData = userData;
+}
+
+// ==================== 控制接口（异步） ====================
+
 void PlayerImpl::prepare() {
-    enum class CallbackToNotify {
-        None,
-        Prepared,
-        Error
-    };
-
-    CallbackToNotify callbackToNotify = CallbackToNotify::None;
-    PlayerCallbacks callbacks{};
-    void* userData = nullptr;
-    int errorCode = 0;
-
-    {
-        std::lock_guard<std::mutex> lock(m_stateMutex);
-        if (m_state != PlayerState::Initialized) {
-            LOGW(TAG, "prepare called in state %d", (int)m_state);
-            return;
-        }
-
-        if (m_demuxer.open(m_dataSource.c_str()) < 0) {
-            m_state = PlayerState::Error;
-            callbacks = m_callbacks;
-            userData = m_userData;
-            errorCode = (int)PlayerError::InvalidDataSource;
-            callbackToNotify = CallbackToNotify::Error;
-        } else {
-            if (m_demuxer.getVideoStreamIndex() >= 0) {
-                auto* par = m_demuxer.getVideoCodecPar();
-                auto tb = m_demuxer.getVideoTimeBase();
-                if (m_videoDecoder.openVideo(par, tb) < 0) {
-                    LOGE(TAG, "Failed to open video decoder");
-                }
-            }
-
-            if (m_demuxer.getAudioStreamIndex() >= 0) {
-                auto* par = m_demuxer.getAudioCodecPar();
-                auto tb = m_demuxer.getAudioTimeBase();
-                if (m_audioDecoder.openAudio(par, tb) < 0) {
-                    LOGE(TAG, "Failed to open audio decoder");
-                } else {
-                    m_audioSampleRate = par->sample_rate;
-                    m_audioChannels = par->ch_layout.nb_channels;
-
-                    m_ringBuffer = new AudioRingBuffer();
-
-                    AVSampleFormat srcFmt = (AVSampleFormat)par->format;
-                    if (srcFmt != AV_SAMPLE_FMT_S16) {
-                        int ret = swr_alloc_set_opts2(&m_swrCtx,
-                            &par->ch_layout, AV_SAMPLE_FMT_S16, m_audioSampleRate,
-                            &par->ch_layout, srcFmt, m_audioSampleRate,
-                            0, nullptr);
-                        if (ret < 0 || !m_swrCtx || swr_init(m_swrCtx) < 0) {
-                            LOGE(TAG, "Failed to init SwrContext");
-                            if (m_swrCtx) swr_free(&m_swrCtx);
-                        }
-                    }
-
-                    auto* aaudio = new AAudioOutput();
-                    if (aaudio->open(m_audioSampleRate, m_audioChannels) == 0) {
-                        m_audioOutput = aaudio;
-                        LOGI(TAG, "AAudio output opened");
-                    } else {
-                        LOGE(TAG, "Failed to open AAudio output");
-                        delete aaudio;
-                    }
-                }
-            }
-
-            m_demuxer.setPacketQueues(&m_videoPacketQueue, &m_audioPacketQueue);
-            m_videoDecoder.setPacketQueue(&m_videoPacketQueue);
-            m_videoDecoder.setFrameQueue(&m_videoFrameQueue);
-            m_audioDecoder.setPacketQueue(&m_audioPacketQueue);
-            m_audioDecoder.setFrameQueue(&m_audioFrameQueue);
-
-            m_state = PlayerState::Prepared;
-            LOGI(TAG, "Prepared, duration=%lld ms", (long long)getDuration());
-
-            callbacks = m_callbacks;
-            userData = m_userData;
-            callbackToNotify = CallbackToNotify::Prepared;
-        }
-    }
-
-    if (callbackToNotify == CallbackToNotify::Prepared && callbacks.onPrepared) {
-        callbacks.onPrepared(userData);
-    } else if (callbackToNotify == CallbackToNotify::Error && callbacks.onError) {
-        callbacks.onError(errorCode, userData);
-    }
+    m_cmdQueue.push({PlayerCommandType::Prepare, 0});
 }
 
 void PlayerImpl::prepareAsync() {
-    std::thread(&PlayerImpl::prepareAsyncThread, this).detach();
-}
-
-void PlayerImpl::prepareAsyncThread() {
-    prepare();
+    m_cmdQueue.push({PlayerCommandType::Prepare, 0});
 }
 
 void PlayerImpl::start() {
-    std::lock_guard<std::mutex> lock(m_stateMutex);
-    if (m_state != PlayerState::Prepared && m_state != PlayerState::Paused) {
-        LOGW(TAG, "start called in state %d", (int)m_state);
-        return;
-    }
-
-    m_demuxer.startReading();
-    if (m_demuxer.getVideoStreamIndex() >= 0) {
-        m_videoDecoder.startDecoding();
-    }
-    if (m_demuxer.getAudioStreamIndex() >= 0) {
-        m_audioDecoder.startDecoding();
-    }
-
-    m_renderRunning = true;
-    m_renderThread = std::thread(&PlayerImpl::renderLoop, this);
-
-    if (m_audioOutput) {
-        m_audioOutput->setCallback([this](uint8_t* buffer, int size) -> int {
-            return m_ringBuffer ? m_ringBuffer->read(buffer, size) : 0;
-        });
-        m_audioRunning = true;
-        m_audioThread = std::thread(&PlayerImpl::audioLoop, this);
-        m_audioOutput->resume();
-    }
-
-    m_state = PlayerState::Started;
-    LOGI(TAG, "Started");
+    m_cmdQueue.push({PlayerCommandType::Start, 0});
 }
 
 void PlayerImpl::pause() {
-    std::lock_guard<std::mutex> lock(m_stateMutex);
-    if (m_state != PlayerState::Started) return;
-
-    m_renderRunning = false;
-    if (m_renderThread.joinable()) {
-        m_renderThread.join();
-    }
-
-    m_videoDecoder.stopDecoding();
-    m_audioDecoder.stopDecoding();
-    m_demuxer.stopReading();
-
-    m_audioRunning = false;
-    if (m_audioThread.joinable()) {
-        m_audioThread.join();
-    }
-    if (m_audioOutput) m_audioOutput->pause();
-
-    m_state = PlayerState::Paused;
-    LOGI(TAG, "Paused");
+    m_cmdQueue.push({PlayerCommandType::Pause, 0});
 }
 
 void PlayerImpl::resume() {
-    std::lock_guard<std::mutex> lock(m_stateMutex);
-    if (m_state != PlayerState::Paused) return;
-
-    m_demuxer.startReading();
-    if (m_demuxer.getVideoStreamIndex() >= 0) {
-        m_videoDecoder.startDecoding();
-    }
-    if (m_demuxer.getAudioStreamIndex() >= 0) {
-        m_audioDecoder.startDecoding();
-    }
-
-    m_renderRunning = true;
-    m_renderThread = std::thread(&PlayerImpl::renderLoop, this);
-
-    if (m_audioOutput) {
-        m_audioRunning = true;
-        m_audioThread = std::thread(&PlayerImpl::audioLoop, this);
-        m_audioOutput->resume();
-    }
-
-    m_state = PlayerState::Started;
-    LOGI(TAG, "Resumed");
-}
-
-void PlayerImpl::stop() {
-    std::lock_guard<std::mutex> lock(m_stateMutex);
-
-    m_renderRunning = false;
-    if (m_renderThread.joinable()) {
-        m_renderThread.join();
-    }
-
-    m_audioRunning = false;
-    if (m_audioThread.joinable()) {
-        m_audioThread.join();
-    }
-
-    m_videoDecoder.stopDecoding();
-    m_audioDecoder.stopDecoding();
-    m_demuxer.stopReading();
-
-    m_videoPacketQueue.abort();
-    m_audioPacketQueue.abort();
-    m_videoFrameQueue.abort();
-    m_audioFrameQueue.abort();
-
-    m_videoPacketQueue.flush();
-    m_audioPacketQueue.flush();
-    m_videoFrameQueue.flush();
-    m_audioFrameQueue.flush();
-
-    if (m_audioOutput) {
-        m_audioOutput->close();
-        delete m_audioOutput;
-        m_audioOutput = nullptr;
-    }
-
-    delete m_ringBuffer;
-    m_ringBuffer = nullptr;
-    if (m_swrCtx) {
-        swr_free(&m_swrCtx);
-    }
-
-    m_videoOutput.destroy();
-    m_audioClock.reset();
-
-    m_state = PlayerState::Stopped;
-    LOGI(TAG, "Stopped");
-}
-
-void PlayerImpl::release() {
-    stop();
-    m_demuxer.close();
-    m_videoDecoder.close();
-    m_audioDecoder.close();
-    m_state = PlayerState::Idle;
+    m_cmdQueue.push({PlayerCommandType::Resume, 0});
 }
 
 void PlayerImpl::seekTo(int64_t positionMs) {
-    if (m_state != PlayerState::Started && m_state != PlayerState::Paused) return;
-
-    m_demuxer.seekTo(positionMs);
-    m_videoDecoder.flush();
-    m_audioDecoder.flush();
-    m_videoFrameQueue.flush();
-    m_audioFrameQueue.flush();
-    if (m_ringBuffer) m_ringBuffer->reset();
-
-    if (m_callbacks.onSeekComplete) {
-        m_callbacks.onSeekComplete(m_userData);
-    }
-    LOGI(TAG, "Seeked to %lld ms", (long long)positionMs);
+    m_cmdQueue.push({PlayerCommandType::Seek, positionMs});
 }
 
+// ==================== 同步控制 ====================
+
+void PlayerImpl::stop() {
+    if (t_inControlThread) {
+        doStop();
+        return;
+    }
+    std::unique_lock<std::mutex> lock(m_waitMutex);
+    m_waitDone = false;
+    m_cmdQueue.push({PlayerCommandType::Stop, 0});
+    m_waitCond.wait(lock, [this] { return m_waitDone.load(); });
+}
+
+void PlayerImpl::release() {
+    if (t_inControlThread) {
+        doStop();
+        m_demuxer.close();
+        m_videoDecoder.close();
+        m_audioDecoder.close();
+        m_state = PlayerState::Idle;
+        return;
+    }
+    std::unique_lock<std::mutex> lock(m_waitMutex);
+    m_waitDone = false;
+    m_cmdQueue.push({PlayerCommandType::Release, 0});
+    m_waitCond.wait(lock, [this] { return m_waitDone.load(); });
+}
+
+// ==================== 查询接口（同步） ====================
+
 int64_t PlayerImpl::getCurrentPosition() {
-    return (int64_t)(m_audioClock.getPTS() * 1000);
+    // 统一走主时钟（有音频流为音频时钟，无音频流为视频时钟）
+    return (int64_t)(m_syncer.getMasterTime() * 1000);
 }
 
 int64_t PlayerImpl::getDuration() {
     return m_demuxer.getDuration();
 }
 
-void PlayerImpl::setCallbacks(const PlayerCallbacks& callbacks) {
-    std::lock_guard<std::mutex> lock(m_stateMutex);
-    m_callbacks = callbacks;
+// ==================== 控制线程 ====================
+
+void PlayerImpl::controlLoop() {
+    t_inControlThread = true;
+    while (m_controlRunning) {
+        auto maybe = m_cmdQueue.pop();
+        if (!maybe) break;
+        handleCommand(*maybe);
+        if (!m_controlRunning) break;
+    }
+    t_inControlThread = false;
 }
 
-void PlayerImpl::setUserData(void* userData) {
-    std::lock_guard<std::mutex> lock(m_stateMutex);
-    m_userData = userData;
+void PlayerImpl::handleCommand(const PlayerCommand& cmd) {
+    switch (cmd.type) {
+        case PlayerCommandType::Prepare:
+            doPrepare();
+            break;
+        case PlayerCommandType::Start:
+            doStart();
+            break;
+        case PlayerCommandType::Pause:
+            doPause();
+            break;
+        case PlayerCommandType::Resume:
+            doResume();
+            break;
+        case PlayerCommandType::Seek:
+            doSeek(cmd.arg);
+            break;
+        case PlayerCommandType::Stop:
+            doStop();
+            notifyDone();
+            break;
+        case PlayerCommandType::Release:
+            doStop();
+            m_demuxer.close();
+            m_videoDecoder.close();
+            m_audioDecoder.close();
+            m_state = PlayerState::Idle;
+            notifyDone();
+            break;
+        case PlayerCommandType::Eos:
+            notifyCompletion();
+            break;
+    }
 }
 
-void PlayerImpl::renderLoop() {
-    setupEGL();
-    if (!m_eglInitialized) {
-        LOGE(TAG, "EGL setup failed, cannot render video");
+void PlayerImpl::notifyDone() {
+    std::lock_guard<std::mutex> lock(m_waitMutex);
+    m_waitDone = true;
+    m_waitCond.notify_all();
+}
+
+// ==================== 命令执行（控制线程） ====================
+
+void PlayerImpl::doPrepare() {
+    if (m_state.load() != PlayerState::Initialized) {
+        LOGW(TAG, "prepare called in state %d", (int)m_state.load());
         return;
     }
 
-    m_videoOutput.init();
-
-    if (m_surfaceWidth > 0 && m_surfaceHeight > 0) {
-        m_videoOutput.setSurfaceSize(m_surfaceWidth, m_surfaceHeight);
+    std::string source;
+    {
+        std::lock_guard<std::mutex> lock(m_configMutex);
+        source = m_dataSource;
     }
 
-    VideoFrame videoFrame;
+    if (m_demuxer.open(source.c_str()) < 0) {
+        m_state = PlayerState::Error;
+        notifyError((int)PlayerError::InvalidDataSource);
+        return;
+    }
 
-    while (m_renderRunning) {
-        if (m_videoFrameQueue.popVideoFrame(&videoFrame, true) < 0) {
-            if (!m_renderRunning) break;
-            continue;
+    // 复用队列（stop 后 abort 过，这里清除 abort 标志）
+    m_videoPacketQueue.reset();
+    m_audioPacketQueue.reset();
+    m_videoFrameQueue.reset();
+    m_audioFrameQueue.reset();
+
+    // 打开视频解码器（失败仅记日志，仍可仅播放音频）
+    if (m_demuxer.getVideoStreamIndex() >= 0) {
+        auto* par = m_demuxer.getVideoCodecPar();
+        auto tb = m_demuxer.getVideoTimeBase();
+        if (m_videoDecoder.openVideo(par, tb) < 0) {
+            LOGE(TAG, "Failed to open video decoder");
         }
+    }
 
-        double delay = m_syncer.computeVideoDelay(videoFrame.pts);
-
-        if (delay > 0) {
-            std::this_thread::sleep_for(
-                std::chrono::microseconds((int64_t)(delay * 1000000)));
-        }
-
-        if (m_videoOutput.renderFrame(&videoFrame) == 0) {
-            if (!eglSwapBuffers(m_eglDisplay, m_eglSurface)) {
-                LOGE(TAG, "eglSwapBuffers failed: 0x%x", eglGetError());
-            }
+    // 打开音频解码器与音频输出链路
+    if (m_demuxer.getAudioStreamIndex() >= 0) {
+        auto* par = m_demuxer.getAudioCodecPar();
+        auto tb = m_demuxer.getAudioTimeBase();
+        if (m_audioDecoder.openAudio(par, tb) < 0) {
+            LOGE(TAG, "Failed to open audio decoder");
         } else {
-            LOGE(TAG, "Failed to render video frame");
-        }
-
-        av_frame_free(&videoFrame.frame);
-
-        if (m_callbacks.onProgress) {
-            m_callbacks.onProgress(getCurrentPosition(), getDuration(), m_userData);
+            m_audioRenderer.open(par->sample_rate, par->ch_layout.nb_channels,
+                                 (AVSampleFormat)par->format, &par->ch_layout);
         }
     }
 
-    m_videoOutput.destroy();
-    teardownEGL();
+    // 主时钟选择：有音频流以音频时钟为准，否则以视频时钟为准（避免无参考时间）
+    if (m_demuxer.getAudioStreamIndex() >= 0) {
+        m_syncer.setMasterTimeProvider([this] { return m_audioRenderer.getCurrentPts(); });
+    } else {
+        m_syncer.setMasterTimeProvider([this] { return m_videoRenderer.getCurrentPts(); });
+    }
+
+    // 串成流水线
+    m_demuxer.setPacketQueues(&m_videoPacketQueue, &m_audioPacketQueue);
+    m_videoDecoder.setPacketQueue(&m_videoPacketQueue);
+    m_videoDecoder.setFrameQueue(&m_videoFrameQueue);
+    m_audioDecoder.setPacketQueue(&m_audioPacketQueue);
+    m_audioDecoder.setFrameQueue(&m_audioFrameQueue);
+
+    // 解封装 EOF 时投递 onCompletion 命令到控制线程
+    m_demuxer.setEosCallback([this]() {
+        m_cmdQueue.push({PlayerCommandType::Eos, 0});
+    });
+
+    // 渲染进度回调节流上报
+    m_videoRenderer.setProgressCallback([this]() {
+        notifyProgress();
+    });
+
+    m_state = PlayerState::Prepared;
+    LOGI(TAG, "Prepared, duration=%lld ms", (long long)getDuration());
+
+    notifyPrepared();
 }
 
-void PlayerImpl::audioLoop() {
-    AudioFrame audioFrame;
+void PlayerImpl::startPipeline() {
+    // 清除 pause 时设置的 abort 标志
+    m_videoFrameQueue.reset();
+    m_audioFrameQueue.reset();
 
-    while (m_audioRunning) {
-        if (m_audioFrameQueue.popAudioFrame(&audioFrame, true) < 0) {
-            if (!m_audioRunning) break;
-            continue;
-        }
-
-        const uint8_t* srcData;
-        int srcSize;
-
-        if (m_swrCtx && audioFrame.frame->format != AV_SAMPLE_FMT_S16) {
-            int nbSamples = audioFrame.frame->nb_samples;
-            int outSamples = swr_get_out_samples(m_swrCtx, nbSamples);
-            int bufSize = outSamples * m_audioChannels * 2;
-            auto* buf = new uint8_t[bufSize];
-
-            int converted = swr_convert(m_swrCtx,
-                &buf, outSamples,
-                (const uint8_t**)audioFrame.frame->data, nbSamples);
-            if (converted > 0) {
-                srcData = buf;
-                srcSize = converted * m_audioChannels * 2;
-            } else {
-                delete[] buf;
-                av_frame_free(&audioFrame.frame);
-                continue;
-            }
-        } else {
-            srcData = audioFrame.frame->data[0];
-            srcSize = audioFrame.frame->nb_samples * m_audioChannels * 2;
-        }
-
-        int written = 0;
-        while (written < srcSize && m_audioRunning) {
-            int n = m_ringBuffer->write(srcData + written, srcSize - written);
-            if (n > 0) {
-                written += n;
-            } else {
-                std::this_thread::sleep_for(std::chrono::microseconds(500));
-            }
-        }
-
-        m_audioClock.setPTS(audioFrame.pts);
-
-        if (m_swrCtx && audioFrame.frame->format != AV_SAMPLE_FMT_S16) {
-            delete[] srcData;
-        }
-        av_frame_free(&audioFrame.frame);
+    m_demuxer.start();
+    if (m_demuxer.getVideoStreamIndex() >= 0) {
+        m_videoDecoder.start();
     }
+    if (m_demuxer.getAudioStreamIndex() >= 0) {
+        m_audioDecoder.start();
+    }
+
+    m_videoRenderer.start();
+    m_audioRenderer.start();
 }
 
-void PlayerImpl::setupEGL() {
-    if (!m_nativeWindow) {
-        LOGE(TAG, "No native window for EGL");
+void PlayerImpl::doStart() {
+    PlayerState s = m_state.load();
+    if (s != PlayerState::Prepared && s != PlayerState::Paused) {
+        LOGW(TAG, "start called in state %d", (int)s);
         return;
     }
-
-    m_eglDisplay = eglGetDisplay(EGL_DEFAULT_DISPLAY);
-    if (m_eglDisplay == EGL_NO_DISPLAY) {
-        LOGE(TAG, "eglGetDisplay failed");
-        return;
-    }
-
-    EGLint major, minor;
-    if (!eglInitialize(m_eglDisplay, &major, &minor)) {
-        LOGE(TAG, "eglInitialize failed");
-        return;
-    }
-
-    EGLint configAttribs[] = {
-        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
-        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
-        EGL_RED_SIZE, 8,
-        EGL_GREEN_SIZE, 8,
-        EGL_BLUE_SIZE, 8,
-        EGL_NONE
-    };
-
-    EGLConfig config;
-    EGLint numConfigs;
-    if (!eglChooseConfig(m_eglDisplay, configAttribs, &config, 1, &numConfigs) || numConfigs == 0) {
-        LOGE(TAG, "eglChooseConfig failed");
-        eglTerminate(m_eglDisplay);
-        m_eglDisplay = EGL_NO_DISPLAY;
-        return;
-    }
-
-    EGLint contextAttribs[] = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
-    m_eglContext = eglCreateContext(m_eglDisplay, config, EGL_NO_CONTEXT, contextAttribs);
-    if (m_eglContext == EGL_NO_CONTEXT) {
-        LOGE(TAG, "eglCreateContext failed");
-        eglTerminate(m_eglDisplay);
-        m_eglDisplay = EGL_NO_DISPLAY;
-        return;
-    }
-
-    m_eglSurface = eglCreateWindowSurface(m_eglDisplay, config, (EGLNativeWindowType)m_nativeWindow, nullptr);
-    if (m_eglSurface == EGL_NO_SURFACE) {
-        LOGE(TAG, "eglCreateWindowSurface failed");
-        eglDestroyContext(m_eglDisplay, m_eglContext);
-        eglTerminate(m_eglDisplay);
-        m_eglDisplay = EGL_NO_DISPLAY;
-        m_eglContext = EGL_NO_CONTEXT;
-        return;
-    }
-
-    if (!eglMakeCurrent(m_eglDisplay, m_eglSurface, m_eglSurface, m_eglContext)) {
-        LOGE(TAG, "eglMakeCurrent failed");
-        eglDestroySurface(m_eglDisplay, m_eglSurface);
-        eglDestroyContext(m_eglDisplay, m_eglContext);
-        eglTerminate(m_eglDisplay);
-        m_eglDisplay = EGL_NO_DISPLAY;
-        m_eglContext = EGL_NO_CONTEXT;
-        m_eglSurface = EGL_NO_SURFACE;
-        return;
-    }
-
-    m_eglInitialized = true;
-    LOGI(TAG, "EGL context created (%dx%d)", major, minor);
+    startPipeline();
+    m_state = PlayerState::Started;
+    LOGI(TAG, "Started");
 }
 
-void PlayerImpl::teardownEGL() {
-    if (!m_eglInitialized) return;
-
-    eglMakeCurrent(m_eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-    if (m_eglSurface != EGL_NO_SURFACE) {
-        eglDestroySurface(m_eglDisplay, m_eglSurface);
-        m_eglSurface = EGL_NO_SURFACE;
-    }
-    if (m_eglContext != EGL_NO_CONTEXT) {
-        eglDestroyContext(m_eglDisplay, m_eglContext);
-        m_eglContext = EGL_NO_CONTEXT;
-    }
-    if (m_eglDisplay != EGL_NO_DISPLAY) {
-        eglTerminate(m_eglDisplay);
-        m_eglDisplay = EGL_NO_DISPLAY;
+void PlayerImpl::doPause() {
+    if (m_state.load() != PlayerState::Started) {
+        LOGW(TAG, "pause called in state %d", (int)m_state.load());
+        return;
     }
 
-    m_eglInitialized = false;
-    LOGI(TAG, "EGL context destroyed");
+    // 1) abort 帧队列唤醒渲染/音频线程，然后停止它们
+    m_videoFrameQueue.abort();
+    m_audioFrameQueue.abort();
+    m_videoRenderer.stop();
+    m_audioRenderer.pause();
+
+    // 2) 暂停解码与读（线程挂起，不退出，保留缓冲）
+    if (m_demuxer.getVideoStreamIndex() >= 0) {
+        m_videoDecoder.pause();
+    }
+    if (m_demuxer.getAudioStreamIndex() >= 0) {
+        m_audioDecoder.pause();
+    }
+    m_demuxer.pause();
+
+    m_state = PlayerState::Paused;
+    LOGI(TAG, "Paused");
+}
+
+void PlayerImpl::doResume() {
+    if (m_state.load() != PlayerState::Paused) {
+        LOGW(TAG, "resume called in state %d", (int)m_state.load());
+        return;
+    }
+    startPipeline();
+    m_state = PlayerState::Started;
+    LOGI(TAG, "Resumed");
+}
+
+void PlayerImpl::doSeek(int64_t positionMs) {
+    PlayerState s = m_state.load();
+    if (s != PlayerState::Started && s != PlayerState::Paused) {
+        LOGW(TAG, "seekTo called in state %d", (int)s);
+        return;
+    }
+
+    // 1) 暂停解码与读（渲染/音频线程不停，靠 serial 丢弃旧帧）
+    if (m_demuxer.getVideoStreamIndex() >= 0) {
+        m_videoDecoder.pause();
+    }
+    if (m_demuxer.getAudioStreamIndex() >= 0) {
+        m_audioDecoder.pause();
+    }
+    m_demuxer.pause();
+
+    // 2) flush 解码器（同步，解码线程执行 avcodec_flush_buffers）
+    if (m_demuxer.getVideoStreamIndex() >= 0) {
+        m_videoDecoder.flush();
+    }
+    if (m_demuxer.getAudioStreamIndex() >= 0) {
+        m_audioDecoder.flush();
+    }
+
+    // 3) flush 帧队列（清空旧帧）
+    m_videoFrameQueue.flush();
+    m_audioFrameQueue.flush();
+
+    // 4) demuxer seek（同步，serial 自增 + flush 包队列）
+    m_demuxer.seekTo(positionMs);
+
+    // 5) 更新渲染/音频的 serial 与 seek 目标（消费时据此精准丢弃）
+    int serial = m_demuxer.getSerial();
+    double targetSec = positionMs / 1000.0;
+    m_videoRenderer.seek(serial, targetSec);
+    m_audioRenderer.seek(serial, targetSec);
+
+    // 6) 恢复（仅 Started 状态恢复；Paused 保持暂停）
+    if (s == PlayerState::Started) {
+        m_demuxer.resume();
+        if (m_demuxer.getVideoStreamIndex() >= 0) {
+            m_videoDecoder.resume();
+        }
+        if (m_demuxer.getAudioStreamIndex() >= 0) {
+            m_audioDecoder.resume();
+        }
+    }
+
+    LOGI(TAG, "Seeked to %lld ms", (long long)positionMs);
+    notifySeekComplete();
+}
+
+void PlayerImpl::doStop() {
+    // 1) abort 帧队列：唤醒渲染/音频线程的 pop 与解码线程的 push
+    m_videoFrameQueue.abort();
+    m_audioFrameQueue.abort();
+
+    // 2) 停止渲染线程 + 停止并释放音频
+    m_videoRenderer.stop();
+    m_audioRenderer.close();
+
+    // 3) 停止解码与读线程
+    m_videoDecoder.stop();
+    m_audioDecoder.stop();
+    m_demuxer.stop();
+
+    // 4) abort + flush 所有队列
+    m_videoPacketQueue.abort();
+    m_audioPacketQueue.abort();
+    m_videoPacketQueue.flush();
+    m_audioPacketQueue.flush();
+    m_videoFrameQueue.flush();
+    m_audioFrameQueue.flush();
+
+    m_state = PlayerState::Stopped;
+    LOGI(TAG, "Stopped");
+}
+
+// ==================== 回调派发（锁外触发，避免重入死锁） ====================
+
+void PlayerImpl::notifyPrepared() {
+    PlayerCallbacks cb;
+    void* ud;
+    {
+        std::lock_guard<std::mutex> lock(m_configMutex);
+        cb = m_callbacks;
+        ud = m_userData;
+    }
+    if (cb.onPrepared) cb.onPrepared(ud);
+}
+
+void PlayerImpl::notifyError(int code) {
+    PlayerCallbacks cb;
+    void* ud;
+    {
+        std::lock_guard<std::mutex> lock(m_configMutex);
+        cb = m_callbacks;
+        ud = m_userData;
+    }
+    if (cb.onError) cb.onError(code, ud);
+}
+
+void PlayerImpl::notifyCompletion() {
+    PlayerCallbacks cb;
+    void* ud;
+    {
+        std::lock_guard<std::mutex> lock(m_configMutex);
+        cb = m_callbacks;
+        ud = m_userData;
+    }
+    if (cb.onCompletion) cb.onCompletion(ud);
+}
+
+void PlayerImpl::notifySeekComplete() {
+    PlayerCallbacks cb;
+    void* ud;
+    {
+        std::lock_guard<std::mutex> lock(m_configMutex);
+        cb = m_callbacks;
+        ud = m_userData;
+    }
+    if (cb.onSeekComplete) cb.onSeekComplete(ud);
+}
+
+void PlayerImpl::notifyProgress() {
+    PlayerCallbacks cb;
+    void* ud;
+    {
+        std::lock_guard<std::mutex> lock(m_configMutex);
+        cb = m_callbacks;
+        ud = m_userData;
+    }
+    if (cb.onProgress) cb.onProgress(getCurrentPosition(), getDuration(), ud);
 }
 
 } // namespace ccplayer

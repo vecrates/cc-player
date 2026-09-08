@@ -31,7 +31,9 @@ add_library(ccplayer STATIC
     src/decoder/Decoder.cpp
     src/sync/Sync.cpp
     src/audio_out/AAudioOutput.cpp
+    src/audio_out/AudioRenderer.cpp
     src/video_out/VideoOutput.cpp
+    src/video_out/VideoRenderer.cpp
     src/player/PlayerImpl.cpp
     src/player/Player.cpp
 )

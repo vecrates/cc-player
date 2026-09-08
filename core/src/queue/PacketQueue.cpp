@@ -1,6 +1,7 @@
 #include "PacketQueue.h"
 #include "platform/log.h"
 #include <cstdlib>
+#include <chrono>
 
 extern "C" {
 #include <libavutil/mem.h>
@@ -26,9 +27,7 @@ PacketQueue::~PacketQueue() {
     flush();
 }
 
-int PacketQueue::push(AVPacket* pkt) {
-    if (m_abort) return -1;
-
+int PacketQueue::push(AVPacket* pkt, int serial) {
     AVPacket* cloned = av_packet_clone(pkt);
     if (!cloned) {
         LOGE(TAG, "Failed to clone packet");
@@ -37,9 +36,22 @@ int PacketQueue::push(AVPacket* pkt) {
 
     auto* node = new PacketNode();
     node->pkt = cloned;
+    node->serial = serial;
     node->next = nullptr;
 
     std::unique_lock<std::mutex> lock(m_mutex);
+
+    // 背压：队列非空且累计字节数超限时阻塞，等待消费方 pop 腾出空间
+    while (m_byteSize > 0 && m_byteSize >= m_maxByteSize && !m_abort) {
+        m_cond.wait(lock);
+    }
+
+    if (m_abort) {
+        // 队列已终止，释放资源
+        delete node;
+        av_packet_free(&cloned);
+        return -1;
+    }
     if (m_tail) {
         m_tail->next = node;
     } else {
@@ -53,7 +65,7 @@ int PacketQueue::push(AVPacket* pkt) {
     return 0;
 }
 
-int PacketQueue::pop(AVPacket* pkt, bool block) {
+int PacketQueue::pop(AVPacket* pkt, int* serialOut, bool block) {
     std::unique_lock<std::mutex> lock(m_mutex);
 
     while (!m_head && !m_abort) {
@@ -69,6 +81,33 @@ int PacketQueue::pop(AVPacket* pkt, bool block) {
     m_count--;
     m_byteSize -= node->pkt->size;
 
+    if (serialOut) *serialOut = node->serial;
+    av_packet_move_ref(pkt, node->pkt);
+    av_packet_free(&node->pkt);
+    delete node;
+
+    m_cond.notify_one();
+    return 0;
+}
+
+int PacketQueue::popTimeout(AVPacket* pkt, int* serialOut, int timeoutMs) {
+    std::unique_lock<std::mutex> lock(m_mutex);
+
+    while (!m_head && !m_abort) {
+        if (m_cond.wait_for(lock, std::chrono::milliseconds(timeoutMs)) == std::cv_status::timeout) {
+            return -2; // 超时，队列仍为空
+        }
+    }
+
+    if (m_abort) return -1;
+
+    PacketNode* node = m_head;
+    m_head = node->next;
+    if (!m_head) m_tail = nullptr;
+    m_count--;
+    m_byteSize -= node->pkt->size;
+
+    if (serialOut) *serialOut = node->serial;
     av_packet_move_ref(pkt, node->pkt);
     av_packet_free(&node->pkt);
     delete node;
@@ -97,6 +136,11 @@ void PacketQueue::abort() {
     std::unique_lock<std::mutex> lock(m_mutex);
     m_abort = true;
     m_cond.notify_all();
+}
+
+void PacketQueue::reset() {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_abort = false;
 }
 
 int PacketQueue::size() const {
