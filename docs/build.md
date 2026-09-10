@@ -104,6 +104,12 @@ Gradle 会自动调用 CMake 构建 native 部分：
 
 - **找不到 FFmpeg 头/库**：确认已运行对应平台的 FFmpeg 构建脚本，且
   `FFMPEG_DIR` 指向含 `include/` 与 `lib/` 的目录；Android 下注意 ABI 子目录。
+  典型报错 `fatal error: 'libavcodec/avcodec.h' file not found` 即为此因——
+  通常是 `third_party/android/<abi>/` 还没有内容（脚本只构建、未拷贝，或
+  直接跑了 ffmpeg-kit 的 `android.sh`）。请确认
+  `third_party/android/arm64-v8a/include/libavcodec/avcodec.h` 存在；
+  若产物还在 `third_party/ffmpeg-kit/prebuilt/android-arm64/ffmpeg/`，
+  手动补拷或重跑 `./scripts/build_ffmpeg_android.sh arm64-v8a` 即可。
 - **NDK 版本不匹配**：`build.gradle` 固定了 `ndkVersion`，请在 SDK Manager 中安装该版本。
 - **无 arm64-v8a 以外的设备**：当前 `abiFilters` 仅含 `arm64-v8a`，如需模拟器
   支持 x86_64，需在 `build.gradle` 中追加并用脚本构建对应 ABI 的 FFmpeg。

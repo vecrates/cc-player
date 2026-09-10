@@ -82,6 +82,8 @@ private:
 
     // 命令执行（均在控制线程）
     void doPrepare();
+    void doStart();       // Prepared / Paused -> Started
+    void doResume();      // Paused -> Started
     void startPipeline(); // start / resume 共用的流水线启动
     void doPause();
     void doSeek(int64_t positionMs);
