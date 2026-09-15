@@ -24,6 +24,8 @@ public:
 
     // 设置媒体源（文件路径或 URL），仅在 Idle/Stopped 状态下有效，成功后进入 Initialized 状态
     void setDataSource(const char* path);
+    // 设置平台 URI 打开器（如 Android content://），需在 prepare 前设置；未设置时 content:// 源无法打开
+    void setFdOpener(FdOpener opener, void* userData);
     // 设置渲染窗口（Android 上为 ANativeWindow*），需在 start 之前设置
     void setSurface(void* nativeWindow);
     // 设置渲染窗口尺寸，用于设置 OpenGL viewport
@@ -48,10 +50,20 @@ public:
     // 跳转到指定位置（异步，毫秒）：刷新解码器与所有队列，完成后回调 onSeekComplete
     void seekTo(int64_t positionMs);
 
+    // 设置播放倍速（异步）：clamp 到 [0.5, 2.0]，任意状态可调用，prepare 前预置生效；变速不变调
+    void setSpeed(float speed);
+
     // 当前播放位置（毫秒），由音频主时钟推导得出（音频作为主时钟驱动视频同步）
     int64_t getCurrentPosition();
     // 媒体总时长（毫秒），来自封装容器信息，0 表示未知（如直播流）
     int64_t getDuration();
+    // 当前播放倍速（[0.5, 2.0]，默认 1.0）
+    float getSpeed() const;
+
+    // 视频编码宽高（像素），未校正旋转，无视频流返回 0；prepare 完成后有效
+    void getVideoSize(int& width, int& height) const;
+    // 视频显示宽高（像素），已应用旋转 metadata，无视频流返回 0；prepare 完成后有效
+    void getDisplayVideoSize(int& width, int& height) const;
 
     // 查询播放器状态机当前状态，详见 PlayerState 定义
     PlayerState getState() const;

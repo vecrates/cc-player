@@ -74,6 +74,14 @@ static void iosLogFunc(ccplayer::LogLevel level, const char* tag, const char* ms
     _cppPlayer->seekTo((int64_t)positionMs);
 }
 
+- (void)setSpeed:(float)speed {
+    _cppPlayer->setSpeed(speed);
+}
+
+- (float)speed {
+    return _cppPlayer->getSpeed();
+}
+
 - (void)release {
     _cppPlayer->release();
 }

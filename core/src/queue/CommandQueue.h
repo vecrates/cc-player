@@ -77,6 +77,11 @@ public:
         return m_deque.empty();
     }
 
+    int size() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_deque.size();
+    }
+
 private:
     std::deque<T> m_deque;
     mutable std::mutex m_mutex;

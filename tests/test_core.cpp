@@ -3,11 +3,24 @@
 
 #include <cstdio>
 #include <cmath>
+#include <cstring>
 #include <thread>
 #include <chrono>
 
 #include "sync/Sync.h"
 #include "queue/CommandQueue.h"
+#include "datasource/FileDataSource.h"
+#include "datasource/FdDataSource.h"
+
+#ifdef _WIN32
+#include <io.h>
+#include <fcntl.h>
+static int openFdReadOnly(const char* path) { return _open(path, _O_RDONLY | _O_BINARY); }
+#else
+#include <fcntl.h>
+#include <unistd.h>
+static int openFdReadOnly(const char* path) { return ::open(path, O_RDONLY); }
+#endif
 
 using namespace ccplayer;
 
@@ -144,6 +157,82 @@ static void test_command_queue_abort_reset() {
     CHECK(v.has_value() && *v == 7);
 }
 
+// ---------- DataSource ----------
+
+static const char* g_tmpPath = "ccplayer_test_tmp.bin";
+
+static void writeTestFile(const char* path, const uint8_t* data, size_t len) {
+    FILE* f = std::fopen(path, "wb");
+    if (f) {
+        std::fwrite(data, 1, len, f);
+        std::fclose(f);
+    }
+}
+
+static void test_file_datasource() {
+    const uint8_t data[] = "hello world, ccplayer";
+    size_t len = sizeof(data) - 1;
+    writeTestFile(g_tmpPath, data, len);
+
+    FileDataSource ds(g_tmpPath);
+    CHECK(ds.open() == 0);
+    CHECK(ds.isSeekable());
+    CHECK(ds.size() == (int64_t)len);
+
+    uint8_t buf[64];
+    int n = ds.read(buf, 5);
+    CHECK(n == 5);
+    CHECK(std::memcmp(buf, "hello", 5) == 0);
+
+    CHECK(ds.seek(6, SEEK_SET) == 6);
+    n = ds.read(buf, 5);
+    CHECK(n == 5);
+    CHECK(std::memcmp(buf, "world", 5) == 0);
+
+    ds.seek((int64_t)len, SEEK_SET);
+    CHECK(ds.read(buf, sizeof(buf)) == 0);
+
+    ds.close();
+
+    FileDataSource bad("nonexistent_ccplayer_test.bin");
+    CHECK(bad.open() < 0);
+
+    std::remove(g_tmpPath);
+}
+
+static void test_fd_datasource() {
+    const uint8_t data[] = "0123456789ABCDEF";
+    size_t len = sizeof(data) - 1;
+    writeTestFile(g_tmpPath, data, len);
+
+    int fd = openFdReadOnly(g_tmpPath);
+    CHECK(fd >= 0);
+
+    // offset=5, length=5 → 数据段 "56789"
+    FdDataSource ds(fd, 5, 5);
+    CHECK(ds.open() == 0);
+    CHECK(ds.isSeekable());
+    CHECK(ds.size() == 5);
+
+    uint8_t buf[16];
+    int n = ds.read(buf, 5);
+    CHECK(n == 5);
+    CHECK(std::memcmp(buf, "56789", 5) == 0);
+
+    // 数据段末尾（fd 后续还有内容，但 length 钳制）返回 0
+    CHECK(ds.read(buf, sizeof(buf)) == 0);
+
+    // seek 回起点读前 2 字节
+    CHECK(ds.seek(0, SEEK_SET) == 0);
+    n = ds.read(buf, 2);
+    CHECK(n == 2);
+    CHECK(std::memcmp(buf, "56", 2) == 0);
+
+    ds.close();  // 关闭 fd
+
+    std::remove(g_tmpPath);
+}
+
 int main() {
     RUN_TEST(test_clock_interpolation);
     RUN_TEST(test_syncer_delay);
@@ -152,6 +241,8 @@ int main() {
     RUN_TEST(test_command_queue_basic);
     RUN_TEST(test_command_queue_blocking_pop);
     RUN_TEST(test_command_queue_abort_reset);
+    RUN_TEST(test_file_datasource);
+    RUN_TEST(test_fd_datasource);
 
     if (g_failures == 0) {
         std::printf("ALL TESTS PASSED\n");

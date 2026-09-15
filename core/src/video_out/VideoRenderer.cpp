@@ -18,6 +18,8 @@ VideoRenderer::VideoRenderer(FrameQueue* frameQueue, AudioVideoSyncer* syncer)
     , m_nativeWindow(nullptr)
     , m_surfaceWidth(0)
     , m_surfaceHeight(0)
+    , m_videoWidth(0)
+    , m_videoHeight(0)
     , m_eglDisplay(EGL_NO_DISPLAY)
     , m_eglContext(EGL_NO_CONTEXT)
     , m_eglSurface(EGL_NO_SURFACE)
@@ -38,6 +40,12 @@ void VideoRenderer::setSurfaceSize(int width, int height) {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_surfaceWidth = width;
     m_surfaceHeight = height;
+}
+
+void VideoRenderer::setVideoSize(int width, int height) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_videoWidth = width;
+    m_videoHeight = height;
 }
 
 void VideoRenderer::setProgressCallback(ProgressCallback cb) {
@@ -66,6 +74,10 @@ void VideoRenderer::seek(int serial, double targetSec) {
     m_videoClock.setPTS(targetSec); // 视频时钟跳到目标位置
 }
 
+void VideoRenderer::setSpeed(double speed) {
+    m_videoClock.setSpeed(speed);
+}
+
 double VideoRenderer::getCurrentPts() {
     return m_videoClock.getPTS();
 }
@@ -83,6 +95,9 @@ void VideoRenderer::renderLoop() {
         std::lock_guard<std::mutex> lock(m_mutex);
         if (m_surfaceWidth > 0 && m_surfaceHeight > 0) {
             m_videoOutput.setSurfaceSize(m_surfaceWidth, m_surfaceHeight);
+        }
+        if (m_videoWidth > 0 && m_videoHeight > 0) {
+            m_videoOutput.setVideoSize(m_videoWidth, m_videoHeight);
         }
     }
 

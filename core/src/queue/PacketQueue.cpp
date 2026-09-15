@@ -11,7 +11,7 @@ extern "C" {
 
 namespace ccplayer {
 
-static const int DEFAULT_MAX_BYTE_SIZE = 15 * 1024 * 1024; // 15MB
+static const int DEFAULT_MAX_BYTE_SIZE = 1 * 1024 * 1024; // 15MB
 
 PacketQueue::PacketQueue()
     : m_head(nullptr)
@@ -41,16 +41,19 @@ int PacketQueue::push(AVPacket* pkt, int serial) {
 
     std::unique_lock<std::mutex> lock(m_mutex);
 
-    // 背压：队列非空且累计字节数超限时阻塞，等待消费方 pop 腾出空间
-    while (m_byteSize > 0 && m_byteSize >= m_maxByteSize && !m_abort) {
-        m_cond.wait(lock);
+    // 背压：队列非空且累计字节数超限时阻塞，等待消费方 pop 腾出空间；
+    // 用带超时的 wait_for 轮询，确保中断标志（seek/pause 置位 m_interrupt）能在无 notify 的情况下
+    // 也能被及时感知（与 Decoder::popTimeout 对称），避免生产者永久阻塞无法响应控制命令
+    while (m_byteSize > 0 && m_byteSize >= m_maxByteSize && !m_abort
+           && !(m_interrupt && m_interrupt->load())) {
+        m_cond.wait_for(lock, std::chrono::milliseconds(20));
     }
 
-    if (m_abort) {
-        // 队列已终止，释放资源
+    if (m_abort || (m_interrupt && m_interrupt->load())) {
+        // 队列已终止或被打断，释放资源；未入队，生产者应回退检查命令
         delete node;
         av_packet_free(&cloned);
-        return -1;
+        return m_abort ? -1 : -2;
     }
     if (m_tail) {
         m_tail->next = node;
@@ -156,6 +159,11 @@ int PacketQueue::byteSize() const {
 void PacketQueue::setMaxByteSize(int maxBytes) {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_maxByteSize = maxBytes;
+}
+
+void PacketQueue::setInterrupt(const std::atomic<bool>* flag) {
+    // 指针仅在生产/消费线程之外配置（prepare 阶段），无需加锁
+    m_interrupt = flag;
 }
 
 } // namespace ccplayer

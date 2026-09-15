@@ -63,6 +63,9 @@ add_library(ccplayer STATIC
     src/platform/log.cpp
     src/queue/PacketQueue.cpp
     src/queue/FrameQueue.cpp
+    src/datasource/FileDataSource.cpp
+    src/datasource/FdDataSource.cpp
+    src/datasource/NetworkDataSource.cpp
     src/demuxer/Demuxer.cpp
     src/decoder/Decoder.cpp
     src/sync/Sync.cpp
@@ -89,6 +92,8 @@ target_link_libraries(ccplayer
     avcodec
     avutil
     swresample
+    avfilter
+    swscale
 )
 
 if(TARGET_ANDROID)

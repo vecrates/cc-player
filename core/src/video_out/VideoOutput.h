@@ -14,6 +14,8 @@ public:
     void destroy();
 
     void setSurfaceSize(int width, int height);
+    // 设置视频显示宽高（含旋转校正），渲染时按此比例居中绘制，四周黑边
+    void setVideoSize(int width, int height);
 
     int renderFrame(VideoFrame* frame);
 
@@ -36,6 +38,9 @@ private:
 
     int m_surfaceWidth;
     int m_surfaceHeight;
+
+    int m_videoWidth;
+    int m_videoHeight;
 
     bool m_initialized;
 };

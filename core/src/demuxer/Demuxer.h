@@ -2,6 +2,7 @@
 
 #include "queue/PacketQueue.h"
 #include "queue/CommandQueue.h"
+#include "datasource/IDataSource.h"
 #include <string>
 #include <atomic>
 #include <thread>
@@ -39,8 +40,9 @@ public:
     Demuxer();
     ~Demuxer();
 
-    // open 由控制线程同步调用（此时读线程未启动，无并发）
-    int open(const char* url);
+    // open 由控制线程同步调用（此时读线程未启动，无并发）。
+    // 接管 dataSource 的所有权：无论成功与否，均由此类负责 delete。
+    int open(IDataSource* dataSource);
     // close 同步：停止读线程并释放 AVFormatContext
     void close();
 
@@ -57,6 +59,10 @@ public:
     int getAudioStreamIndex() const { return m_audioStreamIndex; }
     AVCodecParameters* getVideoCodecPar() const;
     AVCodecParameters* getAudioCodecPar() const;
+    // 视频编码宽高（codecpar->width/height，未校正旋转），无视频流返回 0
+    void getVideoSize(int& width, int& height) const;
+    // 视频显示宽高（已应用 display matrix 旋转，90/270 时交换宽高）
+    void getDisplayVideoSize(int& width, int& height) const;
     AVRational getVideoTimeBase() const;
     AVRational getAudioTimeBase() const;
     int64_t getDuration() const;
@@ -75,8 +81,13 @@ private:
     void handleCommand(const DemuxerCommand& cmd);
     void doSeek(int64_t positionMs);
     static int interruptCallback(void* opaque);
+    // 自定义 AVIO 桥接回调：opaque 为 IDataSource*
+    static int readCallback(void* opaque, uint8_t* buf, int size);
+    static int64_t seekCallback(void* opaque, int64_t offset, int whence);
 
     AVFormatContext* m_fmtCtx;
+    AVIOContext* m_avio;
+    IDataSource* m_dataSource;
     int m_videoStreamIndex;
     int m_audioStreamIndex;
 

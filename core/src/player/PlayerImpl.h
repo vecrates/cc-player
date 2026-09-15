@@ -2,6 +2,9 @@
 
 #include "Player.h"
 #include "demuxer/Demuxer.h"
+#include "datasource/FileDataSource.h"
+#include "datasource/NetworkDataSource.h"
+#include "datasource/FdDataSource.h"
 #include "decoder/Decoder.h"
 #include "queue/PacketQueue.h"
 #include "queue/FrameQueue.h"
@@ -30,6 +33,7 @@ enum class PlayerCommandType {
     Pause,    // 暂停
     Resume,   // 恢复
     Seek,     // 跳转（arg = 目标毫秒）
+    SetSpeed, // 设置倍速（arg = 倍速×1000，范围 500~2000）
     Stop,     // 停止（同步等待完成）
     Release,  // 释放（同步等待完成）
     Eos,      // 解封装到达文件末尾（触发 onCompletion）
@@ -37,7 +41,7 @@ enum class PlayerCommandType {
 
 struct PlayerCommand {
     PlayerCommandType type;
-    int64_t arg; // Seek 的目标位置（毫秒），其余命令忽略
+    int64_t arg; // Seek 的目标位置（毫秒）/ SetSpeed 的倍速×1000，其余命令忽略
 };
 
 /**
@@ -53,6 +57,7 @@ public:
 
     // ===== 配置接口（同步，调用线程执行；需在 prepare 前设置）=====
     void setDataSource(const char* path);
+    void setFdOpener(FdOpener opener, void* userData);
     void setSurface(void* nativeWindow);
     void setSurfaceSize(int width, int height);
     void setCallbacks(const PlayerCallbacks& callbacks);
@@ -65,6 +70,8 @@ public:
     void pause();
     void resume();
     void seekTo(int64_t positionMs);
+    // 设置播放倍速（异步）：clamp 到 [0.5, 2.0]，任意状态可调用，prepare 前预置生效
+    void setSpeed(float speed);
 
     // ===== 同步控制（post 命令并等待完成）=====
     void stop();
@@ -73,6 +80,9 @@ public:
     // ===== 查询接口（同步原子快照）=====
     int64_t getCurrentPosition();
     int64_t getDuration();
+    float getSpeed() const { return m_speed.load(); }
+    void getVideoSize(int& width, int& height) const;
+    void getDisplayVideoSize(int& width, int& height) const;
     PlayerState getState() const { return m_state.load(); }
 
 private:
@@ -82,11 +92,14 @@ private:
 
     // 命令执行（均在控制线程）
     void doPrepare();
+    // 按 scheme 创建数据源（返回的指针由 Demuxer 接管所有权）；不支持的 scheme 返回 nullptr
+    IDataSource* createDataSource(const std::string& uri);
     void doStart();       // Prepared / Paused -> Started
     void doResume();      // Paused -> Started
     void startPipeline(); // start / resume 共用的流水线启动
     void doPause();
     void doSeek(int64_t positionMs);
+    void doSetSpeed(float speed);
     void doStop();
     void notifyDone();    // 同步命令（stop/release）完成通知
 
@@ -102,9 +115,12 @@ private:
     std::string m_dataSource;
     PlayerCallbacks m_callbacks;
     void* m_userData;
+    FdOpener m_fdOpener = nullptr;
+    void* m_fdOpenerUserData = nullptr;
 
     // ===== 状态（仅控制线程写，查询线程原子读）=====
     std::atomic<PlayerState> m_state{PlayerState::Idle};
+    std::atomic<float> m_speed{1.0f}; // 当前倍速（控制线程写，查询线程读）
 
     // ===== 控制线程 =====
     std::thread m_controlThread;

@@ -2,6 +2,7 @@
 
 #include <mutex>
 #include <condition_variable>
+#include <atomic>
 #include <cstdint>
 
 extern "C" {
@@ -36,6 +37,9 @@ public:
 
     void setMaxByteSize(int maxBytes);
 
+    // 设置外部中断标志：push 背压等待时若该标志置位则立即返回（供 seek/pause 打断）
+    void setInterrupt(const std::atomic<bool>* flag);
+
 private:
     PacketNode* m_head;
     PacketNode* m_tail;
@@ -43,6 +47,7 @@ private:
     int m_byteSize;
     int m_maxByteSize;
     bool m_abort;
+    const std::atomic<bool>* m_interrupt = nullptr;
 
     mutable std::mutex m_mutex;
     std::condition_variable m_cond;

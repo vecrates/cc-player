@@ -5,6 +5,9 @@ cmake_minimum_required(VERSION 3.18)
 add_executable(ccplayer_tests
     test_core.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../core/src/sync/Sync.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core/src/platform/log.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core/src/datasource/FileDataSource.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core/src/datasource/FdDataSource.cpp
 )
 
 target_include_directories(ccplayer_tests PRIVATE

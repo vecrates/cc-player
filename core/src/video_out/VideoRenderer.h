@@ -30,6 +30,8 @@ public:
 
     void setSurface(void* nativeWindow);
     void setSurfaceSize(int width, int height);
+    // 设置视频显示宽高（含旋转校正），用于渲染层 letterbox 画面适配
+    void setVideoSize(int width, int height);
     void setProgressCallback(ProgressCallback cb);
 
     // 启动渲染线程（帧队列需已 reset）
@@ -38,6 +40,8 @@ public:
     void stop();
     // 更新 seek 代际与目标：丢弃旧代际帧与目标之前的帧
     void seek(int serial, double targetSec);
+    // 设置播放倍速（透传视频时钟，无音频流时作为主时钟）
+    void setSpeed(double speed);
     // 视频渲染位置（秒）：无音频流时作为主时钟
     double getCurrentPts();
 
@@ -53,6 +57,8 @@ private:
     void* m_nativeWindow;
     int m_surfaceWidth;
     int m_surfaceHeight;
+    int m_videoWidth;
+    int m_videoHeight;
     ProgressCallback m_progressCb;
 
     std::atomic<int> m_serial{0};         // 当前 seek 代际

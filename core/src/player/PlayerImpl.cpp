@@ -49,6 +49,12 @@ void PlayerImpl::setDataSource(const char* path) {
     LOGI(TAG, "Data source set: %s", path);
 }
 
+void PlayerImpl::setFdOpener(FdOpener opener, void* userData) {
+    std::lock_guard<std::mutex> lock(m_configMutex);
+    m_fdOpener = opener;
+    m_fdOpenerUserData = userData;
+}
+
 void PlayerImpl::setSurface(void* nativeWindow) {
     m_videoRenderer.setSurface(nativeWindow);
 }
@@ -93,6 +99,10 @@ void PlayerImpl::seekTo(int64_t positionMs) {
     m_cmdQueue.push({PlayerCommandType::Seek, positionMs});
 }
 
+void PlayerImpl::setSpeed(float speed) {
+    m_cmdQueue.push({PlayerCommandType::SetSpeed, (int64_t)(speed * 1000)});
+}
+
 // ==================== 同步控制 ====================
 
 void PlayerImpl::stop() {
@@ -132,6 +142,14 @@ int64_t PlayerImpl::getDuration() {
     return m_demuxer.getDuration();
 }
 
+void PlayerImpl::getVideoSize(int& width, int& height) const {
+    m_demuxer.getVideoSize(width, height);
+}
+
+void PlayerImpl::getDisplayVideoSize(int& width, int& height) const {
+    m_demuxer.getDisplayVideoSize(width, height);
+}
+
 // ==================== 控制线程 ====================
 
 void PlayerImpl::controlLoop() {
@@ -162,6 +180,9 @@ void PlayerImpl::handleCommand(const PlayerCommand& cmd) {
         case PlayerCommandType::Seek:
             doSeek(cmd.arg);
             break;
+        case PlayerCommandType::SetSpeed:
+            doSetSpeed((float)cmd.arg / 1000.0f);
+            break;
         case PlayerCommandType::Stop:
             doStop();
             notifyDone();
@@ -188,6 +209,43 @@ void PlayerImpl::notifyDone() {
 
 // ==================== 命令执行（控制线程） ====================
 
+IDataSource* PlayerImpl::createDataSource(const std::string& uri) {
+    if (uri.rfind("content://", 0) == 0) {
+        FdOpener opener;
+        void* openerUd;
+        {
+            std::lock_guard<std::mutex> lock(m_configMutex);
+            opener = m_fdOpener;
+            openerUd = m_fdOpenerUserData;
+        }
+        if (!opener) {
+            LOGE(TAG, "content:// source requires setFdOpener");
+            return nullptr;
+        }
+        int64_t offset = 0;
+        int64_t length = -1;
+        int fd = opener(uri.c_str(), &offset, &length, openerUd);
+        if (fd < 0) {
+            LOGE(TAG, "Failed to open content uri: %s", uri.c_str());
+            return nullptr;
+        }
+        return new FdDataSource(fd, offset, length);
+    }
+    if (uri.rfind("http://", 0) == 0 || uri.rfind("https://", 0) == 0) {
+        return new NetworkDataSource(uri.c_str());
+    }
+    if (uri.rfind("file://", 0) == 0) {
+        return new FileDataSource(uri.c_str() + 7);
+    }
+    // 其它 scheme（rtsp/rtmp/udp...）暂时不支持
+    if (uri.find("://") != std::string::npos) {
+        LOGE(TAG, "Unsupported data source scheme: %s", uri.c_str());
+        return nullptr;
+    }
+    // 纯本地路径
+    return new FileDataSource(uri.c_str());
+}
+
 void PlayerImpl::doPrepare() {
     if (m_state.load() != PlayerState::Initialized) {
         LOGW(TAG, "prepare called in state %d", (int)m_state.load());
@@ -200,7 +258,14 @@ void PlayerImpl::doPrepare() {
         source = m_dataSource;
     }
 
-    if (m_demuxer.open(source.c_str()) < 0) {
+    IDataSource* dataSource = createDataSource(source);
+    if (!dataSource) {
+        m_state = PlayerState::Error;
+        notifyError((int)PlayerError::InvalidDataSource);
+        return;
+    }
+    // Demuxer 接管 dataSource 所有权（无论成功失败都会释放）
+    if (m_demuxer.open(dataSource) < 0) {
         m_state = PlayerState::Error;
         notifyError((int)PlayerError::InvalidDataSource);
         return;
@@ -219,6 +284,10 @@ void PlayerImpl::doPrepare() {
         if (m_videoDecoder.openVideo(par, tb) < 0) {
             LOGE(TAG, "Failed to open video decoder");
         }
+        // 将显示宽高（含旋转校正）传给渲染器，用于 letterbox 画面适配
+        int vw = 0, vh = 0;
+        m_demuxer.getDisplayVideoSize(vw, vh);
+        m_videoRenderer.setVideoSize(vw, vh);
     }
 
     // 打开音频解码器与音频输出链路
@@ -378,11 +447,30 @@ void PlayerImpl::doSeek(int64_t positionMs) {
     notifySeekComplete();
 }
 
+void PlayerImpl::doSetSpeed(float speed) {
+    // clamp 到 [0.5, 2.0]，越界记录警告但不中断
+    if (speed < 0.5f) {
+        LOGW(TAG, "setSpeed %.3f out of range, clamp to 0.5", speed);
+        speed = 0.5f;
+    } else if (speed > 2.0f) {
+        LOGW(TAG, "setSpeed %.3f out of range, clamp to 2.0", speed);
+        speed = 2.0f;
+    }
+
+    m_speed = speed;
+
+    // 下发到各同步/渲染组件（倍速作为播放器属性，任意状态均可更新）
+    m_syncer.setSpeed(speed);
+    m_videoRenderer.setSpeed(speed);
+    m_audioRenderer.setSpeed(speed);
+
+    LOGI(TAG, "Speed set to %.2f", speed);
+}
+
 void PlayerImpl::doStop() {
     // 1) abort 帧队列：唤醒渲染/音频线程的 pop 与解码线程的 push
     m_videoFrameQueue.abort();
     m_audioFrameQueue.abort();
-
     // 2) 停止渲染线程 + 停止并释放音频
     m_videoRenderer.stop();
     m_audioRenderer.close();

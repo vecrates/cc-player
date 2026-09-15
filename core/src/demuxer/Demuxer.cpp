@@ -1,12 +1,18 @@
 #include "Demuxer.h"
 #include "platform/log.h"
 
+extern "C" {
+#include <libavutil/display.h>
+}
+
 #define TAG "Demuxer"
 
 namespace ccplayer {
 
 Demuxer::Demuxer()
     : m_fmtCtx(nullptr)
+    , m_avio(nullptr)
+    , m_dataSource(nullptr)
     , m_videoStreamIndex(-1)
     , m_audioStreamIndex(-1)
     , m_videoQueue(nullptr)
@@ -18,11 +24,54 @@ Demuxer::~Demuxer() {
     close();
 }
 
-int Demuxer::open(const char* url) {
-    int ret = avformat_open_input(&m_fmtCtx, url, nullptr, nullptr);
+// 自定义 AVIO 缓冲区大小（与 FFmpeg 默认一致）
+static const int AVIO_BUFFER_SIZE = 32768;
+
+int Demuxer::open(IDataSource* dataSource) {
+    // 若已有源，先释放
+    close();
+
+    m_dataSource = dataSource;
+    m_dataSource->setInterrupt(&m_interrupt);
+
+    int ret = m_dataSource->open();
     if (ret < 0) {
-        LOGE(TAG, "Failed to open input: %s", url);
-        return ret;
+        LOGE(TAG, "DataSource open failed: %d", ret);
+        goto fail;
+    }
+
+    // 1) 构造自定义 AVIO，桥接 IDataSource
+    {
+        auto* buf = (uint8_t*)av_malloc(AVIO_BUFFER_SIZE);
+        if (!buf) {
+            LOGE(TAG, "Failed to allocate AVIO buffer");
+            ret = AVERROR(ENOMEM);
+            goto fail;
+        }
+        m_avio = avio_alloc_context(buf, AVIO_BUFFER_SIZE, 0, m_dataSource,
+                                    readCallback, nullptr, seekCallback);
+        if (!m_avio) {
+            av_freep(&buf);
+            LOGE(TAG, "Failed to allocate AVIOContext");
+            ret = AVERROR(ENOMEM);
+            goto fail;
+        }
+        m_avio->seekable = m_dataSource->isSeekable() ? AVIO_SEEKABLE_NORMAL : 0;
+    }
+
+    // 2) 先分配 context 并注入自定义 pb，再 open_input（filename 传空，pb 已提供）
+    m_fmtCtx = avformat_alloc_context();
+    if (!m_fmtCtx) {
+        LOGE(TAG, "Failed to allocate AVFormatContext");
+        ret = AVERROR(ENOMEM);
+        goto fail;
+    }
+    m_fmtCtx->pb = m_avio;
+
+    ret = avformat_open_input(&m_fmtCtx, nullptr, nullptr, nullptr);
+    if (ret < 0) {
+        LOGE(TAG, "Failed to open input via custom AVIO: %d", ret);
+        goto fail;
     }
 
     // 注册中断回调：seek/pause/stop 通过置位中断标志打断阻塞中的 av_read_frame
@@ -32,8 +81,7 @@ int Demuxer::open(const char* url) {
     ret = avformat_find_stream_info(m_fmtCtx, nullptr);
     if (ret < 0) {
         LOGE(TAG, "Failed to find stream info");
-        close();
-        return ret;
+        goto fail;
     }
 
     for (unsigned i = 0; i < m_fmtCtx->nb_streams; i++) {
@@ -47,14 +95,30 @@ int Demuxer::open(const char* url) {
 
     if (m_videoStreamIndex < 0 && m_audioStreamIndex < 0) {
         LOGE(TAG, "No playable streams found");
-        close();
-        return -1;
+        ret = -1;
+        goto fail;
     }
 
     LOGI(TAG, "Opened: video=%d, audio=%d, duration=%lld ms",
          m_videoStreamIndex, m_audioStreamIndex,
          (long long)(m_fmtCtx->duration / 1000));
     return 0;
+
+fail:
+    // avformat_close_input 对 CUSTOM_IO 的 pb 不释放，需手动释放
+    if (m_fmtCtx) {
+        avformat_close_input(&m_fmtCtx);
+        m_fmtCtx = nullptr;
+    }
+    if (m_avio) {
+        avio_context_free(&m_avio);
+        m_avio = nullptr;
+    }
+    delete m_dataSource;
+    m_dataSource = nullptr;
+    m_videoStreamIndex = -1;
+    m_audioStreamIndex = -1;
+    return ret;
 }
 
 void Demuxer::close() {
@@ -63,6 +127,12 @@ void Demuxer::close() {
         avformat_close_input(&m_fmtCtx);
         m_fmtCtx = nullptr;
     }
+    if (m_avio) {
+        avio_context_free(&m_avio);
+        m_avio = nullptr;
+    }
+    delete m_dataSource;
+    m_dataSource = nullptr;
     m_videoStreamIndex = -1;
     m_audioStreamIndex = -1;
     m_eos = false;
@@ -125,6 +195,10 @@ void Demuxer::stop() {
 void Demuxer::setPacketQueues(PacketQueue* videoQueue, PacketQueue* audioQueue) {
     m_videoQueue = videoQueue;
     m_audioQueue = audioQueue;
+    // 让包队列的背压等待可被 m_interrupt 打断（seek/pause 时置位），
+    // 避免 demuxer 阻塞在 push 而无法回环处理 Pause/Seek 命令（与暂停的 decoder 形成死锁）
+    if (m_videoQueue) m_videoQueue->setInterrupt(&m_interrupt);
+    if (m_audioQueue) m_audioQueue->setInterrupt(&m_interrupt);
 }
 
 void Demuxer::setEosCallback(EosCallback cb) {
@@ -141,6 +215,35 @@ AVCodecParameters* Demuxer::getAudioCodecPar() const {
     return m_fmtCtx->streams[m_audioStreamIndex]->codecpar;
 }
 
+void Demuxer::getVideoSize(int& width, int& height) const {
+    width = 0;
+    height = 0;
+    AVCodecParameters* par = getVideoCodecPar();
+    if (par) {
+        width = par->width;
+        height = par->height;
+    }
+}
+
+void Demuxer::getDisplayVideoSize(int& width, int& height) const {
+    getVideoSize(width, height);
+    if (m_videoStreamIndex < 0 || !m_fmtCtx || width == 0 || height == 0) return;
+
+    // 读取 display matrix 旋转角度，90/270 度时交换宽高得到实际显示尺寸
+    AVStream* stream = m_fmtCtx->streams[m_videoStreamIndex];
+    size_t size = 0;
+    const uint8_t* data = av_stream_get_side_data(stream, AV_PKT_DATA_DISPLAYMATRIX, &size);
+    if (data && size >= 9 * sizeof(int32_t)) {
+        double rotation = av_display_rotation_get(reinterpret_cast<const int32_t*>(data));
+        if (rotation < 0) rotation += 360.0;
+        if ((rotation > 45.0 && rotation < 135.0) || (rotation > 225.0 && rotation < 315.0)) {
+            int tmp = width;
+            width = height;
+            height = tmp;
+        }
+    }
+}
+
 AVRational Demuxer::getVideoTimeBase() const {
     if (m_videoStreamIndex < 0 || !m_fmtCtx) return {1, 1};
     return m_fmtCtx->streams[m_videoStreamIndex]->time_base;
@@ -152,13 +255,31 @@ AVRational Demuxer::getAudioTimeBase() const {
 }
 
 int64_t Demuxer::getDuration() const {
-    if (!m_fmtCtx) return 0;
+    // 未知/不可 seek 源（直播等）duration 为 0 或 AV_NOPTS_VALUE（负值），统一返回 0
+    if (!m_fmtCtx || m_fmtCtx->duration <= 0) return 0;
     return m_fmtCtx->duration / 1000; // convert to ms
 }
 
 int Demuxer::interruptCallback(void* opaque) {
     auto* self = static_cast<Demuxer*>(opaque);
     return self->m_interrupt.load() ? 1 : 0;
+}
+
+int Demuxer::readCallback(void* opaque, uint8_t* buf, int size) {
+    auto* src = static_cast<IDataSource*>(opaque);
+    int ret = src->read(buf, size);
+    if (ret == 0) return AVERROR_EOF;
+    if (ret == -DS_INTERRUPTED) return AVERROR_EXIT;
+    if (ret < 0) return AVERROR(EIO);
+    return ret;
+}
+
+int64_t Demuxer::seekCallback(void* opaque, int64_t offset, int whence) {
+    auto* src = static_cast<IDataSource*>(opaque);
+    if (whence == AVSEEK_SIZE) return src->size();
+    int64_t ret = src->seek(offset, whence);
+    if (ret < 0) return AVERROR(EIO);
+    return ret;
 }
 
 void Demuxer::threadLoop() {
@@ -171,7 +292,7 @@ void Demuxer::threadLoop() {
 
     while (m_running) {
         // 1) 处理所有积压命令
-        DemuxerCommand cmd;
+        DemuxerCommand cmd{};
         while (m_cmdQueue.tryPop(cmd)) {
             handleCommand(cmd);
             if (!m_running) break;

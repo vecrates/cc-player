@@ -61,6 +61,8 @@ VideoOutput::VideoOutput()
     , m_texHeight(0)
     , m_surfaceWidth(0)
     , m_surfaceHeight(0)
+    , m_videoWidth(0)
+    , m_videoHeight(0)
     , m_initialized(false)
 {
 }
@@ -98,7 +100,10 @@ int VideoOutput::init() {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     }
 
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+
     m_initialized = true;
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     LOGI(TAG, "VideoOutput initialized");
     return 0;
 }
@@ -125,12 +130,41 @@ void VideoOutput::setSurfaceSize(int width, int height) {
     glViewport(0, 0, width, height);
 }
 
+void VideoOutput::setVideoSize(int width, int height) {
+    m_videoWidth = width;
+    m_videoHeight = height;
+}
+
 int VideoOutput::renderFrame(VideoFrame* frame) {
     if (!m_initialized || !frame || !frame->frame) return -1;
 
     uploadFrame(frame);
 
+    // 显示宽高：优先使用 prepare 阶段传入的显示宽高（含旋转校正），否则用帧宽高
+    int vw = m_videoWidth > 0 ? m_videoWidth : frame->frame->width;
+    int vh = m_videoHeight > 0 ? m_videoHeight : frame->frame->height;
+
+    // 1) 全屏黑底（黑边区域）
+    glViewport(0, 0, m_surfaceWidth, m_surfaceHeight);
     glClear(GL_COLOR_BUFFER_BIT);
+
+    // 2) 计算保持比例的居中矩形 viewport（letterbox）
+    if (vw > 0 && vh > 0 && m_surfaceWidth > 0 && m_surfaceHeight > 0) {
+        double videoAspect = (double)vw / vh;
+        double surfaceAspect = (double)m_surfaceWidth / m_surfaceHeight;
+        int vx = 0, vy = 0, vw2 = m_surfaceWidth, vh2 = m_surfaceHeight;
+        if (videoAspect > surfaceAspect) {
+            vw2 = m_surfaceWidth;
+            vh2 = (int)(m_surfaceWidth / videoAspect);
+            vy = (m_surfaceHeight - vh2) / 2;
+        } else {
+            vh2 = m_surfaceHeight;
+            vw2 = (int)(m_surfaceHeight * videoAspect);
+            vx = (m_surfaceWidth - vw2) / 2;
+        }
+        glViewport(vx, vy, vw2, vh2);
+    }
+
     glUseProgram(m_program);
 
     glActiveTexture(GL_TEXTURE0);

@@ -33,6 +33,12 @@ enum class PlayerError {
 };
 
 /**
+ * 平台 URI 打开器：用于打开 content:// 等平台专属 URI，返回 fd（所有权转移给调用方）。
+ * offset/length 为出参（数据在 fd 中的起始偏移与长度，长度未知时置 -1）；失败返回 -1。
+ */
+using FdOpener = int (*)(const char* uri, int64_t* offset, int64_t* length, void* userData);
+
+/**
  * 播放器事件回调集合，未设置的回调不触发。
  * 注意：除个别例外外回调均在后台线程触发，上层需自行处理线程切换（如 JNI 层切回 Java 层）。
  */

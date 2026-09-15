@@ -165,7 +165,7 @@ void Decoder::decodeLoop() {
 
     while (m_running) {
         // 1) 处理所有积压命令
-        DecoderCommand cmd;
+        DecoderCommand cmd{};
         while (m_cmdQueue.tryPop(cmd)) {
             handleCommand(cmd);
             if (!m_running) break;

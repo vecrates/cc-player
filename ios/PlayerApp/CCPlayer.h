@@ -40,6 +40,9 @@ typedef NS_ENUM(NSInteger, CCPlayerState) {
 - (void)resume;
 - (void)stop;
 - (void)seekTo:(NSTimeInterval)positionMs;
+// 设置播放倍速（变速不变调），范围 [0.5, 2.0]，越界自动 clamp
+- (void)setSpeed:(float)speed;
+- (float)speed;
 - (void)release;
 
 @end
